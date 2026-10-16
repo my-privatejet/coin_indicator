@@ -12,6 +12,7 @@ from common_engine import (
     BaseIndicator,
     LiveBar,
     Signal,
+    TIMEFRAME_SECONDS,
     configure_indicators,
     configure_runtime,
     make_common_symbol_groups,
@@ -125,6 +126,13 @@ class GorillaABCIndicator(BaseIndicator):
         self._pair_locks: dict[str, threading.RLock] = {}
         self._locks_guard = threading.RLock()
 
+        # Low-latency interest registry.
+        # Only pairs that still have at least one unused live target receive
+        # trade processing from common_engine.
+        self._interest_lock = threading.RLock()
+        self._live_pairs: set[str] = set()
+        self._live_symbol_counts: dict[str, int] = {}
+
     @staticmethod
     def _key(symbol: str, timeframe: str) -> str:
         return f"{symbol}:{timeframe}"
@@ -137,6 +145,56 @@ class GorillaABCIndicator(BaseIndicator):
                 lock = threading.RLock()
                 self._pair_locks[key] = lock
             return lock
+
+    def _sync_live_interest(
+        self,
+        symbol: str,
+        timeframe: str,
+        state: Optional[PairState],
+    ) -> None:
+        key = self._key(symbol, timeframe)
+
+        needed = False
+        if state is not None and state.initialized:
+            for slot in range(2):
+                if not state.active[slot]:
+                    continue
+
+                start = slot * 3
+                for k in range(start, start + 3):
+                    if state.targets[k] is not None and not state.used[k]:
+                        needed = True
+                        break
+
+                if needed:
+                    break
+
+        with self._interest_lock:
+            already = key in self._live_pairs
+            if needed == already:
+                return
+
+            if needed:
+                self._live_pairs.add(key)
+                self._live_symbol_counts[symbol] = (
+                    self._live_symbol_counts.get(symbol, 0) + 1
+                )
+            else:
+                self._live_pairs.discard(key)
+                count = self._live_symbol_counts.get(symbol, 0) - 1
+                if count > 0:
+                    self._live_symbol_counts[symbol] = count
+                else:
+                    self._live_symbol_counts.pop(symbol, None)
+
+    def wants_live_trade(self, symbol: str, timeframe: str) -> bool:
+        key = self._key(symbol, timeframe)
+        with self._interest_lock:
+            return key in self._live_pairs
+
+    def wants_symbol_trade(self, symbol: str) -> bool:
+        with self._interest_lock:
+            return self._live_symbol_counts.get(symbol, 0) > 0
 
     # ========================================================
     # TRANSACTION SNAPSHOT / ROLLBACK
@@ -160,8 +218,16 @@ class GorillaABCIndicator(BaseIndicator):
         with lock:
             if snapshot is None:
                 self._states.pop(key, None)
+                restored = None
             else:
                 self._states[key] = copy.deepcopy(snapshot)
+                restored = self._states[key]
+
+            self._sync_live_interest(
+                symbol,
+                timeframe,
+                restored,
+            )
 
     # ========================================================
     # PINE f_pivot()
@@ -626,9 +692,10 @@ class GorillaABCIndicator(BaseIndicator):
                     df=df,
                     current_candle=current_candle,
                 )
-                print(
-                    f"[ABC INIT] {symbol} {timeframe} "
-                    f"확정봉={len(df) if df is not None else 0}"
+                self._sync_live_interest(
+                    symbol,
+                    timeframe,
+                    self._states[key],
                 )
                 return []
 
@@ -717,11 +784,54 @@ class GorillaABCIndicator(BaseIndicator):
                 log_setup=True,
             )
 
+            # Publish newly-created live interest immediately. This narrows the
+            # window in which the next candle has started but its trades are
+            # still being filtered before the setup becomes visible.
+            self._sync_live_interest(
+                symbol,
+                timeframe,
+                state,
+            )
+
             if setup_signals:
                 signals.extend(setup_signals)
 
+            # If the just-closed candle created/updated a setup while the next
+            # candle had already started, catch up using the current candle's
+            # observed high/low. This prevents an early next-bar touch from
+            # being lost while the closed-candle event was waiting to run.
+            if current_candle is not None:
+                current_open = int(current_candle.get("open_time", 0) or 0)
+                if current_open > open_time:
+                    step_ms = int(TIMEFRAME_SECONDS[timeframe]) * 1000
+                    bars_ahead = max(1, (current_open - open_time) // step_ms)
+                    catchup_bar_index = bar_index + int(bars_ahead)
+
+                    catchup_signals = self._touch_targets(
+                        state=state,
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        bar_index=catchup_bar_index,
+                        low=float(current_candle["low"]),
+                        high=float(current_candle["high"]),
+                        ts_ms=int(
+                            current_candle.get("last_ts_ms")
+                            or current_candle.get("open_time")
+                            or open_time
+                        ),
+                        emit=True,
+                    )
+                    if catchup_signals:
+                        signals.extend(catchup_signals)
+
             state.last_closed_index = bar_index
             state.last_closed_open_time = open_time
+
+            self._sync_live_interest(
+                symbol,
+                timeframe,
+                state,
+            )
 
             return signals
 
@@ -746,7 +856,7 @@ class GorillaABCIndicator(BaseIndicator):
             if state is None or not state.initialized:
                 return []
 
-            return self._touch_targets(
+            signals = self._touch_targets(
                 state=state,
                 symbol=symbol,
                 timeframe=timeframe,
@@ -756,6 +866,13 @@ class GorillaABCIndicator(BaseIndicator):
                 ts_ms=int(ts_ms),
                 emit=True,
             )
+
+            self._sync_live_interest(
+                symbol,
+                timeframe,
+                state,
+            )
+            return signals
 
     # ========================================================
     # PERSISTENT GLOBAL STATE
