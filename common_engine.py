@@ -9,7 +9,7 @@ import threading
 import time
 import zlib
 from abc import ABC
-from collections import deque
+from collections import deque, OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
@@ -177,6 +177,7 @@ TELEGRAM_POLL_SECONDS = 0.20
 CACHE_FLUSH_SECONDS = 60.0
 STATE_FLUSH_SECONDS = 5.0
 SHUTDOWN_DRAIN_SECONDS = 10.0
+VERBOSE_PAIR_INIT = False
 
 # For production: every indicator must support pair-state snapshot/rollback.
 REQUIRE_TRANSACTIONAL_INDICATORS = True
@@ -252,6 +253,18 @@ class RealtimeEvent:
     attempt: int = 0
 
 
+@dataclass
+class TradeAggregate:
+    base_open_ms: int
+    open: float
+    high: float
+    low: float
+    close: float
+    first_ts_ms: int
+    last_ts_ms: int
+    first_enqueued_mono: float
+
+
 class BaseIndicator(ABC):
     """
     Indicator contract.
@@ -294,6 +307,16 @@ class BaseIndicator(ABC):
         live_bar: LiveBar,
     ) -> list[Signal]:
         return []
+
+    def wants_live_trade(self, symbol: str, timeframe: str) -> bool:
+        # Safe default for generic indicators: if live trade mode is enabled,
+        # keep receiving trades. Optimized indicators may override this.
+        return bool(self.use_live_trade)
+
+    def wants_symbol_trade(self, symbol: str) -> bool:
+        # Safe default prevents accidental signal loss for indicators that
+        # do not provide an optimized symbol-level interest registry.
+        return bool(self.use_live_trade)
 
     def snapshot_pair_state(self, symbol: str, timeframe: str) -> Any:
         return None
@@ -340,10 +363,22 @@ INDICATORS: list[BaseIndicator] = []
 LIVE_INDICATORS: list[BaseIndicator] = []
 HISTORY_LIMIT = 300
 
-# Separate queues: closed candles always have priority over trades.
-CANDLE_QUEUES: list[Queue] = [Queue() for _ in range(REALTIME_WORKERS)]
-TRADE_QUEUES: list[Queue] = [Queue() for _ in range(REALTIME_WORKERS)]
+# One FIFO queue per worker. Same symbol is always mapped to the same worker.
+# Trade bursts are coalesced per symbol/5m bucket so the queue cannot grow
+# one item per exchange trade.
+REALTIME_QUEUES: list[Queue] = [Queue() for _ in range(REALTIME_WORKERS)]
 REALTIME_THREADS: list[threading.Thread] = []
+
+TRADE_AGG_LOCK = threading.RLock()
+TRADE_AGGREGATES: dict[str, OrderedDict[int, TradeAggregate]] = {}
+TRADE_TOKEN_ACTIVE: set[str] = set()
+
+# Railway log protection: repeated lag messages are summarized instead of
+# flooding stdout.
+LAG_LOG_LOCK = threading.RLock()
+LAG_LOG_LAST_MONO: dict[int, float] = {}
+LAG_LOG_SUPPRESSED: dict[int, int] = {}
+LAG_LOG_INTERVAL_SECONDS = 5.0
 
 TELEGRAM_THREADS: list[threading.Thread] = []
 
@@ -1539,6 +1574,52 @@ def update_live_bar(
         return copy.copy(bar)
 
 
+
+def update_live_bar_range(
+    symbol: str,
+    timeframe: str,
+    *,
+    open_price: float,
+    high: float,
+    low: float,
+    close: float,
+    first_ts_ms: int,
+    last_ts_ms: int,
+) -> LiveBar:
+    """
+    Merge a coalesced 5m trade slice into the timeframe live bar.
+
+    Every supported timeframe boundary is aligned to a 5m boundary, so a
+    single 5m aggregate never straddles two buckets of any supported TF.
+    """
+    key = pair_key(symbol, timeframe)
+    bucket = timeframe_bucket(timeframe, last_ts_ms)
+    open_ms = bucket_open_ms(timeframe, last_ts_ms)
+
+    with LIVE_BAR_LOCK:
+        bar = LIVE_BARS.get(key)
+
+        if bar is None or bar.bucket != bucket:
+            bar = LiveBar(
+                bucket=bucket,
+                open=float(open_price),
+                high=float(high),
+                low=float(low),
+                close=float(close),
+                first_ts_ms=open_ms,
+                last_ts_ms=int(last_ts_ms),
+            )
+            LIVE_BARS[key] = bar
+        else:
+            bar.high = max(float(bar.high), float(high))
+            bar.low = min(float(bar.low), float(low))
+            if int(last_ts_ms) >= int(bar.last_ts_ms):
+                bar.close = float(close)
+                bar.last_ts_ms = int(last_ts_ms)
+
+        return copy.copy(bar)
+
+
 def seed_live_bar_from_current_candle(
     symbol: str,
     timeframe: str,
@@ -1593,6 +1674,7 @@ def current_live_candle(symbol: str, timeframe: str) -> Optional[dict]:
             "low": float(bar.low),
             "close": float(bar.close),
             "close_time": open_time + TIMEFRAME_SECONDS[timeframe] * 1000,
+            "last_ts_ms": int(bar.last_ts_ms),
             "confirm": "0",
         }
 
@@ -1624,6 +1706,55 @@ def configure_indicators(indicators: list[BaseIndicator]) -> None:
     HISTORY_LIMIT = max(int(i.history_limit) for i in INDICATORS)
 
 
+
+def symbol_needs_live_trade(symbol: str) -> bool:
+    if not LIVE_INDICATORS:
+        return False
+
+    for indicator in LIVE_INDICATORS:
+        try:
+            if indicator.wants_symbol_trade(symbol):
+                return True
+        except Exception as e:
+            # Fail open for correctness. An optimization bug must never
+            # silently drop exchange trades.
+            print(
+                f"[LIVE INTEREST ERROR] {indicator.name} {symbol}: {e}; "
+                "fail-open"
+            )
+            return True
+    return False
+
+
+def interested_live_indicators(
+    symbol: str,
+    timeframe: str,
+) -> list[BaseIndicator]:
+    result: list[BaseIndicator] = []
+    for indicator in LIVE_INDICATORS:
+        try:
+            if indicator.wants_live_trade(symbol, timeframe):
+                result.append(indicator)
+        except Exception as e:
+            print(
+                f"[LIVE INTEREST ERROR] {indicator.name} "
+                f"{symbol} {timeframe}: {e}; fail-open"
+            )
+            result.append(indicator)
+    return result
+
+
+def snapshot_selected_pair_states(
+    indicators: list[BaseIndicator],
+    symbol: str,
+    timeframe: str,
+) -> list[tuple[BaseIndicator, Any]]:
+    return [
+        (indicator, indicator.snapshot_pair_state(symbol, timeframe))
+        for indicator in indicators
+    ]
+
+
 def run_startup_indicators(
     symbol: str,
     timeframe: str,
@@ -1653,36 +1784,54 @@ def run_startup_indicators(
     return True
 
 
-def process_trade(symbol: str, price: float, ts_ms: int) -> None:
+def process_trade_aggregate(symbol: str, aggregate: TradeAggregate) -> None:
     if not LIVE_INDICATORS:
         return
 
     for timeframe in TIMEFRAMES:
         key = pair_key(symbol, timeframe)
 
-        # Drop a delayed trade that belongs to an already committed candle.
-        trade_open = bucket_open_ms(timeframe, ts_ms)
+        # Aggregate belongs entirely to one 5m bucket, therefore also to one
+        # bucket for every supported timeframe.
+        trade_open = bucket_open_ms(timeframe, aggregate.last_ts_ms)
         last_processed = PROCESSED_OPEN_TIME.get(key)
         if last_processed is not None and trade_open <= last_processed:
             continue
-
-        live_bar = update_live_bar(symbol, timeframe, price, ts_ms)
 
         if not is_pair_ready(symbol, timeframe):
             continue
         if is_pair_recovering(symbol, timeframe):
             continue
 
-        snapshots = snapshot_pair_states(symbol, timeframe)
+        interested = interested_live_indicators(symbol, timeframe)
+        if not interested:
+            continue
+
+        live_bar = update_live_bar_range(
+            symbol,
+            timeframe,
+            open_price=aggregate.open,
+            high=aggregate.high,
+            low=aggregate.low,
+            close=aggregate.close,
+            first_ts_ms=aggregate.first_ts_ms,
+            last_ts_ms=aggregate.last_ts_ms,
+        )
+
+        snapshots = snapshot_selected_pair_states(
+            interested,
+            symbol,
+            timeframe,
+        )
         all_signals: list[Signal] = []
 
         try:
-            for indicator in LIVE_INDICATORS:
+            for indicator in interested:
                 signals = indicator.on_trade(
                     symbol=symbol,
                     timeframe=timeframe,
-                    price=price,
-                    ts_ms=ts_ms,
+                    price=float(aggregate.close),
+                    ts_ms=int(aggregate.last_ts_ms),
                     live_bar=live_bar,
                 )
                 if signals:
@@ -1979,19 +2128,123 @@ def _recover_one_pair(symbol: str, timeframe: str) -> None:
 
 
 # ============================================================
-# SEPARATE REALTIME QUEUES
+# LOW-LATENCY REALTIME QUEUES
 # ============================================================
 
 def enqueue_realtime_event(event: RealtimeEvent) -> None:
     idx = stable_worker_index(event.symbol)
-    q = CANDLE_QUEUES[idx] if event.kind == "closed_candle" else TRADE_QUEUES[idx]
+    q = REALTIME_QUEUES[idx]
     q.put_nowait(event)
 
     size = q.qsize()
     if size >= REALTIME_QUEUE_WARN_SIZE and size % 1000 == 0:
         print(
             f"[CRITICAL][REALTIME BACKLOG] worker={idx} "
-            f"kind={event.kind} queue={size} symbol={event.symbol}"
+            f"queue={size} kind={event.kind} symbol={event.symbol}"
+        )
+
+
+def enqueue_trade_update(
+    symbol: str,
+    price: float,
+    ts_ms: int,
+) -> None:
+    """
+    Hot-path trade ingestion.
+
+    1) If no live indicator currently needs this symbol, do not queue it.
+    2) For an active symbol, merge every trade inside the same 5m bucket.
+    3) At most one trade token per symbol may be queued/processing.
+
+    This changes queue growth from O(number of exchange trades) to roughly
+    O(number of active symbols + candle events) while preserving high/low
+    crossings for target-touch detection.
+    """
+    if not symbol_needs_live_trade(symbol):
+        return
+
+    now_mono = time.monotonic()
+    base_open = bucket_open_ms("5m", int(ts_ms))
+    should_enqueue = False
+
+    with TRADE_AGG_LOCK:
+        buckets = TRADE_AGGREGATES.setdefault(symbol, OrderedDict())
+        agg = buckets.get(base_open)
+
+        if agg is None:
+            buckets[base_open] = TradeAggregate(
+                base_open_ms=int(base_open),
+                open=float(price),
+                high=float(price),
+                low=float(price),
+                close=float(price),
+                first_ts_ms=int(ts_ms),
+                last_ts_ms=int(ts_ms),
+                first_enqueued_mono=now_mono,
+            )
+        else:
+            agg.high = max(float(agg.high), float(price))
+            agg.low = min(float(agg.low), float(price))
+            if int(ts_ms) >= int(agg.last_ts_ms):
+                agg.close = float(price)
+                agg.last_ts_ms = int(ts_ms)
+
+        if symbol not in TRADE_TOKEN_ACTIVE:
+            TRADE_TOKEN_ACTIVE.add(symbol)
+            should_enqueue = True
+
+    if should_enqueue:
+        enqueue_realtime_event(
+            RealtimeEvent(
+                kind="trade",
+                symbol=symbol,
+                enqueued_mono=now_mono,
+            )
+        )
+
+
+def _pop_trade_aggregate(symbol: str) -> Optional[TradeAggregate]:
+    with TRADE_AGG_LOCK:
+        buckets = TRADE_AGGREGATES.get(symbol)
+        if not buckets:
+            return None
+
+        # OrderedDict insertion order follows exchange time in normal WS flow.
+        _, agg = buckets.popitem(last=False)
+        if not buckets:
+            TRADE_AGGREGATES.pop(symbol, None)
+        return agg
+
+
+def _finish_trade_token(symbol: str) -> None:
+    """
+    Keep one token active while pending aggregates remain. If new trades
+    arrived during processing, enqueue exactly one continuation token.
+    """
+    requeue = False
+    now_mono = time.monotonic()
+
+    with TRADE_AGG_LOCK:
+        buckets = TRADE_AGGREGATES.get(symbol)
+
+        # If all targets became inactive while this token was processed,
+        # pending trade slices are no longer needed.
+        if buckets and not symbol_needs_live_trade(symbol):
+            TRADE_AGGREGATES.pop(symbol, None)
+            buckets = None
+
+        if buckets:
+            requeue = True
+        else:
+            TRADE_TOKEN_ACTIVE.discard(symbol)
+
+    if requeue:
+        enqueue_realtime_event(
+            RealtimeEvent(
+                kind="trade",
+                symbol=symbol,
+                enqueued_mono=now_mono,
+            )
         )
 
 
@@ -2019,55 +2272,61 @@ def schedule_candle_retry(event: RealtimeEvent) -> None:
     ).start()
 
 
-def _get_next_event(worker_index: int) -> tuple[Optional[RealtimeEvent], Optional[Queue]]:
-    cq = CANDLE_QUEUES[worker_index]
-    tq = TRADE_QUEUES[worker_index]
+def _log_realtime_lag(
+    worker_index: int,
+    lag_ms: float,
+    event: RealtimeEvent,
+) -> None:
+    now = time.monotonic()
 
-    # Hard priority for closed candles.
-    try:
-        return cq.get_nowait(), cq
-    except Empty:
-        pass
+    with LAG_LOG_LOCK:
+        last = LAG_LOG_LAST_MONO.get(worker_index, 0.0)
+        if now - last < LAG_LOG_INTERVAL_SECONDS:
+            LAG_LOG_SUPPRESSED[worker_index] = (
+                LAG_LOG_SUPPRESSED.get(worker_index, 0) + 1
+            )
+            return
 
-    # Short wait for trade. Re-check candle before processing trade.
-    try:
-        trade = tq.get(timeout=0.05)
-    except Empty:
-        return None, None
+        suppressed = LAG_LOG_SUPPRESSED.pop(worker_index, 0)
+        LAG_LOG_LAST_MONO[worker_index] = now
 
-    try:
-        candle = cq.get_nowait()
-        # Put trade back at the front is not possible with Queue.
-        # Requeueing at tail is acceptable because stale trades are discarded
-        # after a closed-candle checkpoint.
-        tq.task_done()
-        tq.put_nowait(trade)
-        return candle, cq
-    except Empty:
-        return trade, tq
+    extra = f" suppressed={suppressed}" if suppressed else ""
+    print(
+        f"[CRITICAL][REALTIME LAG] worker={worker_index} "
+        f"lag={lag_ms:.0f}ms kind={event.kind} symbol={event.symbol}"
+        f"{extra}"
+    )
 
 
 def realtime_worker_loop(worker_index: int) -> None:
     print(f"[REALTIME WORKER {worker_index}] 시작")
+    q = REALTIME_QUEUES[worker_index]
 
     while not ENGINE_STOP.is_set():
-        event, source_q = _get_next_event(worker_index)
-        if event is None or source_q is None:
+        try:
+            event = q.get(timeout=0.05)
+        except Empty:
             continue
 
         try:
-            lag_ms = (time.monotonic() - event.enqueued_mono) * 1000
-            if lag_ms >= REALTIME_LAG_WARN_MS:
-                print(
-                    f"[CRITICAL][REALTIME LAG] worker={worker_index} "
-                    f"lag={lag_ms:.0f}ms kind={event.kind} symbol={event.symbol}"
-                )
-
             if event.kind == "trade":
-                if event.price is not None and event.ts_ms is not None:
-                    process_trade(event.symbol, event.price, event.ts_ms)
+                aggregate = _pop_trade_aggregate(event.symbol)
+                if aggregate is None:
+                    continue
+
+                lag_ms = (
+                    time.monotonic() - aggregate.first_enqueued_mono
+                ) * 1000
+                if lag_ms >= REALTIME_LAG_WARN_MS:
+                    _log_realtime_lag(worker_index, lag_ms, event)
+
+                process_trade_aggregate(event.symbol, aggregate)
 
             elif event.kind == "closed_candle":
+                lag_ms = (time.monotonic() - event.enqueued_mono) * 1000
+                if lag_ms >= REALTIME_LAG_WARN_MS:
+                    _log_realtime_lag(worker_index, lag_ms, event)
+
                 if event.timeframe and event.candle:
                     status = process_closed_candle(
                         event.symbol,
@@ -2085,7 +2344,15 @@ def realtime_worker_loop(worker_index: int) -> None:
             if event.kind == "closed_candle" and event.candle and event.timeframe:
                 schedule_candle_retry(event)
         finally:
-            source_q.task_done()
+            if event.kind == "trade":
+                try:
+                    _finish_trade_token(event.symbol)
+                except Exception as e:
+                    print(
+                        f"[TRADE TOKEN ERROR] worker={worker_index} "
+                        f"symbol={event.symbol}: {e}"
+                    )
+            q.task_done()
 
     print(f"[REALTIME WORKER {worker_index}] 종료")
 
@@ -2101,6 +2368,7 @@ def start_realtime_workers() -> None:
         )
         t.start()
         REALTIME_THREADS.append(t)
+
 
 
 # ============================================================
@@ -2169,14 +2437,10 @@ class OKXTradeWebSocket:
             except Exception:
                 continue
 
-            enqueue_realtime_event(
-                RealtimeEvent(
-                    kind="trade",
-                    symbol=symbol,
-                    price=price,
-                    ts_ms=ts_ms,
-                    enqueued_mono=time.monotonic(),
-                )
+            enqueue_trade_update(
+                symbol=symbol,
+                price=price,
+                ts_ms=ts_ms,
             )
 
     def _on_error(self, ws, error) -> None:
@@ -2469,7 +2733,8 @@ def initialize_pair(symbol: str, timeframe: str) -> None:
         )
         PROCESSED_OPEN_TIME[key] = last_open
         finish_pair_initialization_and_flush(symbol, timeframe)
-        print(f"[PAIR READY] {symbol} {timeframe}")
+        if VERBOSE_PAIR_INIT:
+            print(f"[PAIR READY] {symbol} {timeframe}")
     except Exception:
         restore_pair_states(symbol, timeframe, snapshots)
         raise
@@ -2588,14 +2853,12 @@ def stop_ws_clients(
 def wait_realtime_queues(timeout: float) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        unfinished = sum(q.unfinished_tasks for q in CANDLE_QUEUES)
-        unfinished += sum(q.unfinished_tasks for q in TRADE_QUEUES)
+        unfinished = sum(q.unfinished_tasks for q in REALTIME_QUEUES)
         if unfinished == 0:
             return
         time.sleep(0.05)
 
-    unfinished = sum(q.unfinished_tasks for q in CANDLE_QUEUES)
-    unfinished += sum(q.unfinished_tasks for q in TRADE_QUEUES)
+    unfinished = sum(q.unfinished_tasks for q in REALTIME_QUEUES)
     if unfinished:
         print(
             f"[STOP WARN] 미처리 realtime event={unfinished}. "
@@ -2668,8 +2931,8 @@ def main() -> None:
         f"[READY] pair={len(READY_PAIRS)}/{len(ALL_SYMBOLS) * len(TIMEFRAMES)}"
     )
     print(
-        "[READY] candle 우선 queue / WS GAP 복구 / SQLite outbox / "
-        "pair-state rollback 활성"
+        "[READY] same-symbol FIFO / active-target trade filter / trade coalescing / "
+        "WS GAP 복구 / SQLite outbox / pair-state rollback 활성"
     )
 
     try:
