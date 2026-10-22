@@ -25,9 +25,9 @@ from common_engine import (
 # ============================================================
 # Telegram Bot Token은 common_engine.py의 TELEGRAM_BOT_TOKEN 하나를 공통 사용한다.
 
-ABC_MAJOR_CHAT_ID = "-5113269084"   # 메인코인 방
-ABC_MEME_CHAT_ID = "-5399297130"    # 밈코인 방
-ABC_ALT_CHAT_ID = "-5283048931"     # 알트코인 방
+ABC_MAJOR_CHAT_ID = "-1004383738174"   # 메인코인 방
+ABC_MEME_CHAT_ID = "-1004491392399"    # 밈코인 방
+ABC_ALT_CHAT_ID = "-1004331876591"     # 알트코인 방
 
 
 # ============================================================
